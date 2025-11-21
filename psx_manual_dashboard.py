@@ -1,212 +1,381 @@
+"""
+Updated PSX Portfolio Dashboard with Sector Analysis and Upload History
+====================================================================
+
+This Streamlit app extends the original PSX portfolio dashboard to
+include sector information, sector allocation charts, and sector‑wise
+summary statistics. It also maintains a history of uploaded Excel files
+for later reference.
+
+Features
+--------
+
+* **Login screen.** A simple email prompt is used in lieu of full
+  Google authentication. Entering your email allows you to proceed to
+  the dashboard. (Full Google OAuth integration requires external
+  configuration and is not included here.)
+
+* **Excel upload.** Upload a `.xlsx` file with a sheet named
+  `My_Stocks` that contains the columns `Symbol`, `Quantity`,
+  `Buy Price` and `Sector`. Additional columns are ignored. A copy of
+  every uploaded file is saved to the `uploaded_history` directory with
+  a timestamped filename. Links to download prior uploads appear in
+  the sidebar.
+
+* **Live price retrieval.** Latest prices for PSX symbols are fetched
+  using Yahoo Finance (`yfinance` library). Symbols are expected
+  without the `.PSX` suffix; the suffix is appended automatically.
+
+* **Portfolio metrics.** For each holding, the app calculates cost,
+  market value, profit/loss (PKR) and profit/loss percent.
+
+* **Sector analysis.** Holdings are grouped by the `Sector` column to
+  compute total cost, market value and P/L for each sector. Summary
+  tables and bar charts display the allocation and performance across
+  sectors.
+
+* **Download report.** A button allows users to download an Excel file
+  that contains two sheets: `Portfolio_Details` (per‑stock metrics) and
+  `Sector_Summary` (sector‑level metrics).
+
+Dependencies
+------------
+
+The script uses the following Python libraries:
+
+* `streamlit`
+* `pandas`
+* `yfinance`
+* `openpyxl` (for reading Excel files)
+* `xlsxwriter` (for writing Excel files)
+
+Install them via pip:
+
+```
+pip install streamlit pandas yfinance openpyxl xlsxwriter
+```
+
+Usage
+-----
+
+Run the application with Streamlit:
+
+```
+streamlit run psx_excel_dashboard_app_updated.py
+```
+
+Upon launching, the app prompts for an email. After logging in,
+upload your Excel file and explore the portfolio and sector analysis.
+
+"""
+
 import io
+import os
 from datetime import datetime
+from typing import Dict, List
 
 import pandas as pd
 import streamlit as st
+import yfinance as yf
 
-# ---------- DATA LOADING ----------
+# Yahoo Finance suffix for PSX symbols
+PSX_SUFFIX = ".PSX"
+# Directory to store uploaded files history
+UPLOAD_HISTORY_DIR = "uploaded_history"
 
-def load_manual_portfolio(file) -> pd.DataFrame:
+
+def get_live_psx_prices(symbols: List[str]) -> Dict[str, float]:
+    """Fetch latest close price for a list of PSX symbols via Yahoo Finance.
+
+    Parameters
+    ----------
+    symbols : list of str
+        Tickers without the `.PSX` suffix.
+
+    Returns
+    -------
+    dict
+        Mapping of symbol to current price. Missing symbols will be
+        absent from the dictionary.
     """
-    Expects an Excel file with a sheet named 'My_Stocks'
-    containing columns:
-      - Symbol
-      - Quantity
-      - Buy Price
-      - Current Price
+    prices: Dict[str, float] = {}
+    if not symbols:
+        return prices
+    # Append the PSX suffix to each symbol
+    yf_symbols = [s + PSX_SUFFIX for s in symbols]
+    try:
+        data = yf.download(
+            " ".join(yf_symbols),
+            period="1d",
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+        )
+        # If multiple tickers, data columns will be a MultiIndex
+        if isinstance(data.columns, pd.MultiIndex):
+            last_close = data["Close"].iloc[-1]
+            for yf_sym, price in last_close.items():
+                if pd.isna(price):
+                    continue
+                base_symbol = yf_sym.split(".")[0]
+                prices[base_symbol] = float(price)
+        else:
+            # Single ticker case
+            last_close = data["Close"].iloc[-1]
+            base_symbol = symbols[0]
+            prices[base_symbol] = float(last_close)
+    except Exception as e:
+        st.warning(f"Error while fetching prices: {e}")
+    return prices
+
+
+def compute_sector_summary(pf: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate portfolio metrics by sector.
+
+    Parameters
+    ----------
+    pf : DataFrame
+        DataFrame with per‑stock metrics including `Sector`, `cost`,
+        `market_value` and `pnl` columns.
+
+    Returns
+    -------
+    DataFrame
+        Summary table with total cost, market value, P/L and P/L % per
+        sector.
     """
-    df = pd.read_excel(file, sheet_name="My_Stocks")
-
-    # Normalize column names
-    df.columns = [c.strip().lower() for c in df.columns]
-
-    required = {"symbol", "quantity", "buy price", "current price"}
-    if not required.issubset(set(df.columns)):
-        raise ValueError(
-            "Sheet 'My_Stocks' must have columns: "
-            "Symbol, Quantity, Buy Price, Current Price"
-        )
-
-    pf = pd.DataFrame()
-    pf["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
-    pf["quantity"] = df["quantity"].astype(float)
-    pf["buy_price"] = df["buy price"].astype(float)
-    pf["current_price"] = df["current price"].astype(float)
-
-    return pf
+    summary = (
+        pf.groupby("Sector")[["cost", "market_value", "pnl"]]
+        .sum()
+        .reset_index()
+    )
+    summary["pnl_pct"] = summary.apply(
+        lambda row: (row["pnl"] / row["cost"] * 100) if row["cost"] != 0 else 0,
+        axis=1,
+    )
+    return summary
 
 
-# ---------- CALCULATIONS ----------
+def save_upload(file_buffer: bytes, original_name: str) -> str:
+    """Save uploaded file buffer to the history directory with a timestamp.
 
-def compute_portfolio(df: pd.DataFrame) -> pd.DataFrame:
-    pf = df.copy()
-    pf["cost"] = pf["quantity"] * pf["buy_price"]
-    pf["market_value"] = pf["quantity"] * pf["current_price"]
-    pf["pnl"] = pf["market_value"] - pf["cost"]
-    pf["pnl_pct"] = (pf["pnl"] / pf["cost"]) * 100
-    return pf
+    Parameters
+    ----------
+    file_buffer : bytes
+        Raw bytes of the uploaded file.
+    original_name : str
+        Original filename from the upload widget.
+
+    Returns
+    -------
+    str
+        The path where the file was saved.
+    """
+    os.makedirs(UPLOAD_HISTORY_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base, ext = os.path.splitext(original_name)
+    safe_base = base.replace(" ", "_")
+    filename = f"{safe_base}_{timestamp}{ext}"
+    filepath = os.path.join(UPLOAD_HISTORY_DIR, filename)
+    with open(filepath, "wb") as f:
+        f.write(file_buffer)
+    return filepath
 
 
-# ---------- STREAMLIT UI ----------
+def load_portfolio_from_excel(uploaded_file) -> pd.DataFrame:
+    """Load the user's portfolio from the uploaded Excel file.
 
-st.set_page_config(
-    page_title="PSX Manual Portfolio Dashboard",
-    page_icon="📊",
-    layout="wide",
-)
+    Expects a sheet named `My_Stocks` with at least the columns:
+    `Symbol`, `Quantity`, `Buy Price` and `Sector`. If `Sector` is
+    missing, a default value of 'Unknown' will be used.
 
-st.title("📊 PSX Portfolio Dashboard (Manual Prices)")
-st.caption(
-    "Upload an Excel file with a 'My_Stocks' sheet containing: "
-    "Symbol, Quantity, Buy Price, Current Price."
-)
+    Parameters
+    ----------
+    uploaded_file : a file‑like object
+        The uploaded Excel file from Streamlit.
 
-st.sidebar.header("Upload Portfolio")
+    Returns
+    -------
+    DataFrame
+        DataFrame of the holdings.
+    """
+    df = pd.read_excel(uploaded_file, sheet_name="My_Stocks")
+    # Normalize column names by stripping and lowering
+    df.columns = [c.strip() for c in df.columns]
+    # Ensure required columns exist
+    required_cols = {"Symbol", "Quantity", "Buy Price"}
+    if not required_cols.issubset(set(df.columns)):
+        missing = required_cols - set(df.columns)
+        raise ValueError(f"Missing required columns in 'My_Stocks' sheet: {missing}")
+    # Ensure Sector column exists
+    if "Sector" not in df.columns:
+        df["Sector"] = "Unknown"
+    # Clean up data types
+    df["Symbol"] = df["Symbol"].astype(str).str.strip().str.upper()
+    df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0)
+    df["Buy Price"] = pd.to_numeric(df["Buy Price"], errors="coerce").fillna(0.0)
+    df["Sector"] = df["Sector"].astype(str).str.strip()
+    return df
 
-uploaded_file = st.sidebar.file_uploader(
-    "Upload Excel portfolio file",
-    type=["xlsx"],
-    help="Must contain a sheet named 'My_Stocks' with columns: Symbol, Quantity, Buy Price, Current Price.",
-)
 
-with st.expander("Sample structure of 'My_Stocks' sheet"):
-    st.table(
-        pd.DataFrame(
-            {
-                "Symbol": ["EFERT", "HUBC", "SYS"],
-                "Quantity": [100, 250, 50],
-                "Buy Price": [90.50, 110.00, 420.00],
-                "Current Price": [95.00, 118.25, 410.00],
-            }
-        )
+def main():
+    # Configure the page
+    st.set_page_config(
+        page_title="PSX Portfolio Dashboard with Sector Analysis",
+        page_icon="📈",
+        layout="wide",
     )
 
-if not uploaded_file:
-    st.info("⬆️ Upload your Excel file to see the analysis dashboard.")
-    st.stop()
+    # Simple login mechanism
+    if "logged_in" not in st.session_state:
+        st.session_state["logged_in"] = False
+    if not st.session_state["logged_in"]:
+        st.title("Login")
+        st.write(
+            "Enter your email to proceed. (Full Google OAuth requires external configuration.)"
+        )
+        email = st.text_input("Email")
+        if st.button("Login"):
+            if not email:
+                st.warning("Please enter a valid email.")
+            else:
+                st.session_state["user"] = email
+                st.session_state["logged_in"] = True
+        st.stop()
 
-# Load portfolio
-try:
-    portfolio_df = load_manual_portfolio(uploaded_file)
-except Exception as e:
-    st.error(f"Error loading Excel file: {e}")
-    st.stop()
+    st.title("📈 PSX Portfolio Dashboard with Sector Analysis")
+    st.caption(
+        "Upload an Excel file with a sheet named 'My_Stocks' containing columns "
+        "Symbol, Quantity, Buy Price and Sector. Sector is optional but recommended."
+    )
 
-# Compute metrics
-pf = compute_portfolio(portfolio_df)
+    # Sidebar: upload widget and history display
+    st.sidebar.header("Portfolio Input")
+    uploaded_file = st.sidebar.file_uploader(
+        "Upload PSX portfolio Excel file", type=["xlsx"], help="Expected sheet: My_Stocks"
+    )
 
-total_cost = pf["cost"].sum()
-total_value = pf["market_value"].sum()
-total_pnl = pf["pnl"].sum()
-total_pnl_pct = (total_pnl / total_cost) * 100 if total_cost else 0.0
-
-# ---------- KPIs ----------
-
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Total Cost (PKR)", f"{total_cost:,.0f}")
-k2.metric("Market Value (PKR)", f"{total_value:,.0f}")
-k3.metric("Total P/L (PKR)", f"{total_pnl:,.0f}")
-k4.metric("Total P/L (%)", f"{total_pnl_pct:,.2f}%")
-
-st.caption(f"Last updated (based on your file): {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-# ---------- Winners / Losers ----------
-
-st.subheader("Performance Summary")
-
-winners = pf[pf["pnl"] > 0].copy()
-losers = pf[pf["pnl"] < 0].copy()
-
-col_win, col_lose = st.columns(2)
-
-with col_win:
-    st.markdown("✅ **Winners (Positive P/L)**")
-    if winners.empty:
-        st.write("No winning positions.")
+    st.sidebar.subheader("Upload History")
+    if os.path.exists(UPLOAD_HISTORY_DIR):
+        history_files = sorted(os.listdir(UPLOAD_HISTORY_DIR), reverse=True)
+        for hfile in history_files:
+            filepath = os.path.join(UPLOAD_HISTORY_DIR, hfile)
+            with open(filepath, "rb") as f:
+                data = f.read()
+            st.sidebar.download_button(
+                label=hfile,
+                data=data,
+                file_name=hfile,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
     else:
-        w_disp = winners[["symbol", "pnl", "pnl_pct", "market_value"]].copy()
-        w_disp["pnl"] = w_disp["pnl"].map(lambda x: f"{x:,.0f}")
-        w_disp["pnl_pct"] = w_disp["pnl_pct"].map(lambda x: f"{x:,.2f}%")
-        w_disp["market_value"] = w_disp["market_value"].map(lambda x: f"{x:,.0f}")
-        st.dataframe(w_disp, use_container_width=True)
+        st.sidebar.write("No uploads yet.")
 
-with col_lose:
-    st.markdown("❌ **Losers (Negative P/L)**")
-    if losers.empty:
-        st.write("No losing positions.")
-    else:
-        l_disp = losers[["symbol", "pnl", "pnl_pct", "market_value"]].copy()
-        l_disp["pnl"] = l_disp["pnl"].map(lambda x: f"{x:,.0f}")
-        l_disp["pnl_pct"] = l_disp["pnl_pct"].map(lambda x: f"{x:,.2f}%")
-        l_disp["market_value"] = l_disp["market_value"].map(lambda x: f"{x:,.0f}")
-        st.dataframe(l_disp, use_container_width=True)
+    # If no file is uploaded, show instructions and stop
+    if not uploaded_file:
+        st.info(
+            "⬆️ Please upload your portfolio Excel file to see the dashboard."
+        )
+        return
 
-# Top gainers / losers
-st.subheader("Top Movers")
+    # Save uploaded file to history
+    save_upload(uploaded_file.getbuffer(), uploaded_file.name)
 
-if not pf.empty:
-    top_gainers = pf.sort_values("pnl_pct", ascending=False).head(5)
-    top_losers = pf.sort_values("pnl_pct", ascending=True).head(5)
+    # Load and validate portfolio
+    try:
+        portfolio_df = load_portfolio_from_excel(uploaded_file)
+    except Exception as e:
+        st.error(f"Error reading portfolio: {e}")
+        return
 
-    c1, c2 = st.columns(2)
+    # Fetch live PSX prices
+    symbols = portfolio_df["Symbol"].tolist()
+    live_prices = get_live_psx_prices(symbols)
+    portfolio_df["current_price"] = portfolio_df["Symbol"].map(live_prices)
 
-    with c1:
-        st.markdown("🚀 **Top Gainers (by % P/L)**")
-        tg = top_gainers[["symbol", "pnl", "pnl_pct", "market_value"]].copy()
-        tg["pnl"] = tg["pnl"].map(lambda x: f"{x:,.0f}")
-        tg["pnl_pct"] = tg["pnl_pct"].map(lambda x: f"{x:,.2f}%")
-        tg["market_value"] = tg["market_value"].map(lambda x: f"{x:,.0f}")
-        st.dataframe(tg, use_container_width=True)
+    # Warn if some prices are missing
+    missing_prices = portfolio_df[portfolio_df["current_price"].isna()]["Symbol"].tolist()
+    if missing_prices:
+        st.warning(
+            "Could not fetch live price for: " + ", ".join(missing_prices)
+            + ". Check if these symbols exist on Yahoo Finance with .PSX suffix."
+        )
+        # Fill missing prices with zero to avoid NaNs in calculations
+        portfolio_df["current_price"] = portfolio_df["current_price"].fillna(0.0)
 
-    with c2:
-        st.markdown("📉 **Top Losers (by % P/L)**")
-        tl = top_losers[["symbol", "pnl", "pnl_pct", "market_value"]].copy()
-        tl["pnl"] = tl["pnl"].map(lambda x: f"{x:,.0f}")
-        tl["pnl_pct"] = tl["pnl_pct"].map(lambda x: f"{x:,.2f}%")
-        tl["market_value"] = tl["market_value"].map(lambda x: f"{x:,.0f}")
-        st.dataframe(tl, use_container_width=True)
+    # Compute per‑holding metrics
+    portfolio_df["cost"] = portfolio_df["Quantity"] * portfolio_df["Buy Price"]
+    portfolio_df["market_value"] = portfolio_df["Quantity"] * portfolio_df["current_price"]
+    portfolio_df["pnl"] = portfolio_df["market_value"] - portfolio_df["cost"]
+    portfolio_df["pnl_pct"] = portfolio_df.apply(
+        lambda row: (row["pnl"] / row["cost"] * 100) if row["cost"] != 0 else 0.0,
+        axis=1,
+    )
 
-# ---------- Full Detail Table ----------
+    total_cost = portfolio_df["cost"].sum()
+    total_value = portfolio_df["market_value"].sum()
+    total_pnl = portfolio_df["pnl"].sum()
+    total_pnl_pct = (total_pnl / total_cost * 100) if total_cost else 0.0
 
-st.subheader("Full Holdings Detail")
+    # Compute sector summary
+    sector_summary = compute_sector_summary(portfolio_df)
 
-disp = pf.copy()
-disp["buy_price"] = disp["buy_price"].map(lambda x: f"{x:,.2f}")
-disp["current_price"] = disp["current_price"].map(lambda x: f"{x:,.2f}")
-disp["cost"] = disp["cost"].map(lambda x: f"{x:,.0f}")
-disp["market_value"] = disp["market_value"].map(lambda x: f"{x:,.0f}")
-disp["pnl"] = disp["pnl"].map(lambda x: f"{x:,.0f}")
-disp["pnl_pct"] = disp["pnl_pct"].map(lambda x: f"{x:,.2f}%")
+    # Display portfolio KPIs
+    kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
+    kpi_col1.metric("Total Cost (PKR)", f"{total_cost:,.0f}")
+    kpi_col2.metric("Market Value (PKR)", f"{total_value:,.0f}")
+    kpi_col3.metric("Total P/L (PKR)", f"{total_pnl:,.0f}")
+    kpi_col4.metric("Total P/L (%)", f"{total_pnl_pct:,.2f}%")
+    st.caption(
+        f"Last refreshed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
 
-st.dataframe(disp, use_container_width=True)
+    # Detailed holdings table
+    st.subheader("Holdings Detail")
+    display_pf = portfolio_df.copy()
+    # Format numeric columns for display
+    display_pf["Buy Price"] = display_pf["Buy Price"].map(lambda x: f"{x:,.2f}")
+    display_pf["current_price"] = display_pf["current_price"].map(lambda x: f"{x:,.2f}")
+    display_pf["cost"] = display_pf["cost"].map(lambda x: f"{x:,.0f}")
+    display_pf["market_value"] = display_pf["market_value"].map(lambda x: f"{x:,.0f}")
+    display_pf["pnl"] = display_pf["pnl"].map(lambda x: f"{x:,.0f}")
+    display_pf["pnl_pct"] = display_pf["pnl_pct"].map(lambda x: f"{x:,.2f}%")
+    st.dataframe(display_pf, use_container_width=True)
 
-# ---------- Charts ----------
+    # Sector analysis
+    st.subheader("Sector Allocation and Summary")
+    st.dataframe(sector_summary, use_container_width=True)
 
-c_chart1, c_chart2 = st.columns(2)
+    chart_col1, chart_col2 = st.columns(2)
+    with chart_col1:
+        st.write("Allocation by Sector (Market Value)")
+        if not sector_summary.empty:
+            st.bar_chart(
+                sector_summary.set_index("Sector")["market_value"],
+                use_container_width=True,
+            )
+    with chart_col2:
+        st.write("P/L by Sector")
+        if not sector_summary.empty:
+            st.bar_chart(
+                sector_summary.set_index("Sector")["pnl"],
+                use_container_width=True,
+            )
 
-with c_chart1:
-    st.subheader("Allocation by Market Value")
-    alloc_df = pf[["symbol", "market_value"]].set_index("symbol")
-    st.bar_chart(alloc_df)
+    # Allow user to download a combined report as Excel
+    st.subheader("Download Report")
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        portfolio_df.to_excel(writer, index=False, sheet_name="Portfolio_Details")
+        sector_summary.to_excel(writer, index=False, sheet_name="Sector_Summary")
+    output.seek(0)
+    st.download_button(
+        label="📥 Download Excel Report",
+        data=output,
+        file_name="psx_portfolio_with_sector_analysis.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
-with c_chart2:
-    st.subheader("P/L by Symbol")
-    pl_df = pf[["symbol", "pnl"]].set_index("symbol")
-    st.bar_chart(pl_df)
 
-# ---------- Download analyzed portfolio ----------
-
-st.subheader("Download Analyzed Portfolio as Excel")
-
-output = io.BytesIO()
-export_df = pf.copy()
-with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-    export_df.to_excel(writer, index=False, sheet_name="Analyzed Portfolio")
-output.seek(0)
-
-st.download_button(
-    label="📥 Download Portfolio Analysis Excel",
-    data=output,
-    file_name="psx_portfolio_analysis_manual.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
+if __name__ == "__main__":
+    main()
